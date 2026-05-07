@@ -21,6 +21,10 @@ final class LibraryDataCache {
     /// to detect changes *within* a session; cross-launch staleness is handled by `LibrarySyncManager`.
     private(set) var generation: Int = 0
 
+    /// True once the first cache build completes. Used by the loading screen to gate
+    /// the main UI — becomes true after `generation` moves from 0 → 1.
+    private(set) var isReady: Bool = false
+
     private var buildTask: Task<Void, Never>?
 
     /// Kick off a background rebuild of all cached model arrays.
@@ -38,6 +42,7 @@ final class LibraryDataCache {
             songFilterArtists = result.artistNames
             songFilterGenres = result.genres
             generation += 1
+            isReady = true
             cacheLog.info("Library cache ready — \(result.songs.count) songs, \(result.artists.count) artists, \(result.albums.count) albums")
         }
     }
@@ -51,6 +56,7 @@ final class LibraryDataCache {
         songFilterYears = nil
         songFilterArtists = nil
         songFilterGenres = nil
+        isReady = false
     }
 
     // MARK: - Background Work
@@ -77,8 +83,10 @@ final class LibraryDataCache {
             convertedArtists = []
         }
 
-        // Albums
-        let albumDescriptor = FetchDescriptor<CachedAlbum>(sortBy: [SortDescriptor<CachedAlbum>(\.name)])
+        // Albums — prefetch genreLinks so toAlbum() doesn't fault each relationship lazily,
+        // which would race if two contexts are running concurrently.
+        var albumDescriptor = FetchDescriptor<CachedAlbum>(sortBy: [SortDescriptor<CachedAlbum>(\.name)])
+        albumDescriptor.relationshipKeyPathsForPrefetching = [\.genreLinks]
         let convertedAlbums: [Album]
         if let cached = try? context.fetch(albumDescriptor) {
             convertedAlbums = cached.map { $0.toAlbum() }
@@ -86,20 +94,28 @@ final class LibraryDataCache {
             convertedAlbums = []
         }
 
-        // Songs — single pass for conversion + filter option extraction
+        // Songs — single pass for conversion + year/artist extraction
         let songDescriptor = FetchDescriptor<CachedSong>(sortBy: [SortDescriptor<CachedSong>(\.title)])
         var convertedSongs = [Song]()
         var yearSet = Set<Int>()
         var artistSet = Set<String>()
-        var genreSet = Set<String>()
         if let cached = try? context.fetch(songDescriptor) {
             convertedSongs.reserveCapacity(cached.count)
             for item in cached {
                 convertedSongs.append(item.toSong())
                 if let year = item.year { yearSet.insert(year) }
                 if let artist = item.artist { artistSet.insert(artist) }
-                if let genre = item.genre { genreSet.insert(genre) }
             }
+        }
+
+        // Genres from AlbumGenre index — avoids re-scanning the full song table
+        var genreSet = Set<String>()
+        if let genreLinks = try? context.fetch(FetchDescriptor<AlbumGenre>()) {
+            for link in genreLinks where !link.name.isEmpty { genreSet.insert(link.name) }
+        }
+        // Union in song genres for tracks not linked to an album
+        for song in convertedSongs {
+            if let g = song.genre, !g.isEmpty { genreSet.insert(g) }
         }
 
         let sortedYears = yearSet.sorted(by: >)
